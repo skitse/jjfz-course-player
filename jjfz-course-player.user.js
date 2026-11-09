@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         JJFZ 培训视频续播
 // @namespace    https://github.com/skitse/jjfz-course-player
-// @version      0.3.1
+// @version      0.3.2
 // @description  积极分子（JJFZ）培训视频队列，支持断点续播与静音
 // @match        *://*/jjfz/lesson*
 // @match        *://*/jjfz/play*
 // @license      MIT
 // @homepageURL  https://github.com/skitse/jjfz-course-player
 // @supportURL   https://github.com/skitse/jjfz-course-player/issues
-// @updateURL    https://github.com/skitse/jjfz-course-player/releases/latest/download/jjfz-course-player.user.js
-// @downloadURL  https://github.com/skitse/jjfz-course-player/releases/latest/download/jjfz-course-player.user.js
+// @updateURL    https://raw.githubusercontent.com/skitse/jjfz-course-player/main/jjfz-course-player.user.js
+// @downloadURL  https://raw.githubusercontent.com/skitse/jjfz-course-player/main/jjfz-course-player.user.js
 // @run-at       document-idle
 // @noframes
 // @grant        GM_registerMenuCommand
@@ -21,10 +21,26 @@
   'use strict';
 
   const page = new URL(location.href);
-  const centerPath = '/jjfz/lesson';
-  const catalogPath = '/jjfz/lesson/video';
-  const playerPath = '/jjfz/play';
-  const path = page.pathname.replace(/\/$/, '');
+  if (!['http:', 'https:'].includes(page.protocol)) return;
+
+  const path = page.pathname.replace(/\/$/, '') || '/';
+  const prefix = path.match(/^(.*)\/(?:lesson|play)$/)?.[1] ?? '/jjfz';
+  const routesKey = 'routes:' + page.origin;
+  const configuredRoutes = parseRoutes(GM_getValue(routesKey, null));
+  const defaultRoutes = [prefix + '/lesson', prefix + '/lesson/video', prefix + '/play'];
+  const [centerPath, catalogPath, playerPath] = configuredRoutes?.includes(path) ? configuredRoutes : defaultRoutes;
+  GM_registerMenuCommand('配置本站页面地址', () => {
+    const value = prompt('每行填一个地址，顺序为课程中心、课件列表、视频播放页。支持本站完整网址或路径，留空恢复默认。', (configuredRoutes ?? defaultRoutes).join('\n'));
+    if (value === null) return;
+    const routes = value.trim() ? parseRoutes(value.trim().split(/\r?\n/)) : null;
+    if (value.trim() && !routes) {
+      alert('请输入三个不同的本站地址。');
+      return;
+    }
+    GM_setValue(routesKey, routes);
+    location.reload();
+  });
+
   const stage = page.searchParams.get('stg');
   if (![centerPath, playerPath].includes(path) || !stage) return;
 
@@ -34,8 +50,10 @@
   const isPlayer = path === playerPath && playbackUrl(page.href) && document.querySelector('.vlist .vitem.active');
   if (!centerHasCourses && !isPlayer) return;
 
-  const enabledKey = 'jjfz-course-player:enabled:' + stage;
-  const queueKey = 'jjfz-course-player:queue:' + stage;
+  const scope = centerPath === '/jjfz/lesson' && catalogPath === '/jjfz/lesson/video' && playerPath === '/jjfz/play'
+    ? stage : JSON.stringify([centerPath, catalogPath, playerPath, stage]);
+  const enabledKey = 'jjfz-course-player:enabled:' + scope;
+  const queueKey = 'jjfz-course-player:queue:' + scope;
   const approvedKey = 'approved:' + page.origin;
   const muteKey = 'muted:' + page.origin;
   const resumeLoadGraceMs = 3500; // 网站最多等 3 秒读取断点
@@ -45,7 +63,7 @@
   const stallCheckMs = 10000;
   const stallTimeoutMs = 75000;
   const stallRetryLimit = 2;
-  const stallKey = 'jjfz-course-player:stall:' + [stage, page.searchParams.get('v_id'), page.searchParams.get('r_id')].join(':');
+  const stallKey = 'jjfz-course-player:stall:' + [scope, page.searchParams.get('v_id'), page.searchParams.get('r_id')].join(':');
   const handledButtons = new WeakSet();
   let queue = loadQueue();
   let building = false;
@@ -81,11 +99,24 @@
     if (status.textContent !== message) status.textContent = message;
   }
 
+  function parseRoutes(values) {
+    if (!Array.isArray(values) || values.length !== 3) return null;
+    const paths = [];
+    for (const value of values) {
+      const address = typeof value === 'string' && value.trim();
+      if (!address || !/^(?:\/|https?:\/\/)/i.test(address) || !URL.canParse(address, page.origin)) return null;
+      const url = new URL(address, page.origin);
+      if (url.origin !== page.origin || url.username || url.password) return null;
+      paths.push(url.pathname.replace(/\/$/, '') || '/');
+    }
+    return new Set(paths).size === paths.length ? paths : null;
+  }
+
   function siteUrl(href, expectedPath, base = page) {
     if (!href || !URL.canParse(href, base)) return null;
     const url = new URL(href, base);
     return url.origin === page.origin && !url.username && !url.password
-      && url.pathname.replace(/\/$/, '') === expectedPath && url.searchParams.get('stg') === stage
+      && (url.pathname.replace(/\/$/, '') || '/') === expectedPath && url.searchParams.get('stg') === stage
       ? url : null;
   }
 
@@ -335,7 +366,7 @@
     try {
       await video.play();
     } catch (error) {
-      if (error.name !== 'NotAllowedError' || !enabled || document.hidden
+      if (error.name !== 'NotAllowedError' || !enabled
         || !video.isConnected || hasBlockingDialog()) return;
 
       const wasMuted = video.muted;
@@ -353,7 +384,7 @@
     if (startTimer !== null || !video || video.readyState < 1) return;
     startTimer = setTimeout(() => {
       startTimer = null;
-      if (!enabled || document.hidden || !(startRequested || recoveryVideo === video)) return;
+      if (!enabled || !(startRequested || recoveryVideo === video)) return;
       if (!video.isConnected || findContinueButton()) {
         update();
         return;
@@ -363,7 +394,7 @@
       startRequested = false;
       if (recoveryVideo === video) {
         recoveryVideo = null;
-        lastRecovery = { video, time: video.currentTime };
+        lastRecovery = { video, time: video.currentTime, hidden: document.hidden };
       }
       if (video.paused && !video.ended && !video.error) void playVideo(video);
     }, recovering ? pauseRecoveryDelayMs : resumeLoadGraceMs);
@@ -380,7 +411,7 @@
     const video = event.target;
     if (!enabled || video !== playedVideo || video !== findVideo() || video.ended || video.error) return;
     if (Date.now() - lastPlaybackInput < manualPauseWindowMs) return;
-    if (!document.hidden && lastRecovery?.video === video
+    if (lastRecovery?.video === video && lastRecovery.hidden === document.hidden
       && video.currentTime - lastRecovery.time < minimumProgressBetweenRecoveries) return;
 
     recoveryVideo = video;
@@ -404,7 +435,7 @@
 
   function watchPlaybackProgress() {
     const video = findVideo();
-    if (!enabled || document.hidden || reloading || video !== playedVideo || !video
+    if (!enabled || reloading || video !== playedVideo || !video
       || video.paused || video.ended || hasBlockingDialog()) {
       playbackProgress = null;
       return;
@@ -436,7 +467,7 @@
   }
 
   function update() {
-    if (!enabled || document.hidden) return;
+    if (!enabled) return;
 
     const video = findVideo();
     if (muted && video && mutedVideo !== video) {
@@ -451,6 +482,7 @@
       recoveryVideo = null;
       if (!handledButtons.has(button)) {
         handledButtons.add(button);
+        lastRecovery = null;
         button.click();
       }
       return;
@@ -538,7 +570,14 @@
   document.addEventListener('pointerdown', markPlaybackInput, true);
   document.addEventListener('keydown', markPlaybackInput, true);
   document.addEventListener('volumechange', keepMute, true);
-  document.addEventListener('visibilitychange', update);
+  document.addEventListener('visibilitychange', () => {
+    playbackProgress = null;
+    update();
+  });
+  document.addEventListener('resume', () => {
+    playbackProgress = null;
+    update();
+  });
   setInterval(watchPlaybackProgress, stallCheckMs);
   update();
 })();

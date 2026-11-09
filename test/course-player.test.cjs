@@ -20,13 +20,15 @@ function fixture(origin, stage, counts, options = {}) {
   const session = options.session ?? new Map();
   const prefs = options.prefs ?? new Map();
   const courseIds = counts.map((_, i) => i + 100);
-  const center = new URL('/jjfz/lesson?stg=' + stage, origin);
-  const queueKey = 'jjfz-course-player:queue:' + stage;
+  const [centerPath, catalogPath, playerPath] = options.routes ?? ['/jjfz/lesson', '/jjfz/lesson/video', '/jjfz/play'];
+  const center = new URL(centerPath + '?stg=' + stage, origin);
+  const scope = options.routes ? JSON.stringify([...options.routes, stage]) : stage;
+  const queueKey = 'jjfz-course-player:queue:' + scope;
   const entries = [];
   const catalogs = new Map();
 
   function playerUrl(group, episode) {
-    return '/jjfz/play?v_id=' + group + (episode ? '&r_id=' + episode : '') + '&r=video&stg=' + stage;
+    return playerPath + '?v_id=' + group + (episode ? '&r_id=' + episode : '') + '&r=video&stg=' + stage;
   }
 
   function card(group, count, course, bad = false, optional = false) {
@@ -51,7 +53,7 @@ function fixture(origin, stage, counts, options = {}) {
       options.malformed && i === counts.length - 1 && j === counts[i].length - 1
     ));
     catalogs.set(id, cards);
-    return '<li><a href="/jjfz/lesson/video?stg=' + stage + '&lesson_id=' + id + '">'
+    return '<li><a href="' + catalogPath + '?stg=' + stage + '&lesson_id=' + id + '">'
       + course + '</a><dl><dd>已完成必读课件：0</dd><dd>必读课件：' + counts[i].length + '</dd></dl></li>';
   });
 
@@ -68,7 +70,7 @@ function fixture(origin, stage, counts, options = {}) {
     const intervals = new Map();
     let reloads = 0;
     let now = 0;
-    const player = new URL(href).pathname === '/jjfz/play';
+    const player = new URL(href).pathname === playerPath;
     const html = markup ?? (player ? '<div class="vlist"><div class="vitem active"></div></div><video></video>' : centerHtml());
     const { document, Event } = parseHTML('<html><head></head><body>' + html + '</body></html>');
     const video = document.querySelector('video');
@@ -92,6 +94,8 @@ function fixture(origin, stage, counts, options = {}) {
       GM_registerMenuCommand: (name, fn) => menu.set(name, fn),
       GM_getValue: (key, fallback) => prefs.has(key) ? prefs.get(key) : fallback,
       GM_setValue: (key, value) => prefs.set(key, value),
+      prompt: () => options.promptAnswer ?? null,
+      alert: message => { if (options.alerts) options.alerts.push(message); },
       MutationObserver: class { constructor(fn) { update = fn; } observe() {} },
       setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
       clearTimeout: id => timers.delete(id),
@@ -101,10 +105,10 @@ function fixture(origin, stage, counts, options = {}) {
         assert.equal(url.searchParams.get('stg'), stage);
         assert.equal(config.redirect, 'error');
         requests.push(url.href);
-        if (url.pathname === '/jjfz/lesson') {
+        if (url.pathname === centerPath) {
           return { ok: true, text: async () => centerHtml(url.searchParams.get('page') === '2') };
         }
-        assert.equal(url.pathname, '/jjfz/lesson/video');
+        assert.equal(url.pathname, catalogPath);
         assert.equal(url.searchParams.get('required'), '1');
         const id = Number(url.searchParams.get('lesson_id'));
         if (options.networkFailure && id === courseIds[1]) throw Error('Network failure');
@@ -190,7 +194,7 @@ test('walks all 140 episodes across courses, catalog pages and receipts in eithe
   assert.match(f.load().document.querySelector('[role=status]').textContent, /队列已结束 · 140/);
 });
 
-test('recovers an unexpected pause, defers background recovery and leaves deliberate pauses alone', async () => {
+test('recovers foreground and background pauses without restarting a deliberate pause', async () => {
   const f = fixture('https://learning-a.example', '41', [[1]]);
   await f.load().menu.get(start)();
   const page = f.load(f.entries[0].href);
@@ -220,11 +224,22 @@ test('recovers an unexpected pause, defers background recovery and leaves delibe
   video.paused = true;
   page.emit('pause');
   await page.flushTimers();
-  assert.equal(video.calls, 2);
-  document.hidden = false;
-  page.emit('visibilitychange');
-  await page.flushTimers();
   assert.equal(video.calls, 3);
+
+  video.paused = false;
+  page.emit('playing');
+  video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(video.calls, 3, 'background retries should also be bounded');
+
+  assert.equal(page.showContinue(true), 1);
+  video.paused = false;
+  page.emit('playing');
+  video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(video.calls, 4, 'a new site confirmation starts a new recovery window');
 
   video.paused = false;
   page.emit('playing');
@@ -233,7 +248,25 @@ test('recovers an unexpected pause, defers background recovery and leaves delibe
   video.paused = true;
   page.emit('pause');
   await page.flushTimers();
-  assert.equal(video.calls, 3, 'the player pause control must still work');
+  assert.equal(video.calls, 4, 'the player pause control must still work');
+});
+
+test('starts the next video and handles completion and continue prompts in the background', async () => {
+  const f = fixture('https://learning-a.example', '41', [[2]]);
+  await f.load().menu.get(start)();
+  const first = f.load(f.entries[0].href);
+  first.document.hidden = true;
+  assert.equal(first.showContinue(), 1);
+  assert.equal(first.showContinue(true), 1);
+  first.complete(true);
+  assert.deepEqual(first.visits, [f.entries[1].href]);
+
+  const second = f.load(f.entries[1].href);
+  second.document.hidden = true;
+  await second.flushTimers();
+  assert.equal(second.video.calls, 1);
+  second.complete(false);
+  assert.deepEqual(second.visits, [f.center]);
 });
 
 test('defers recovery while an unfamiliar site dialog is visible', async () => {
@@ -295,7 +328,7 @@ test('reloads a stuck video at most twice and preserves the queue across reload'
   assert.equal(third.reloads, 1, 'real progress past the old stall should restore the retry budget');
 });
 
-test('does not reload when paused or while the video is hidden', async () => {
+test('recovers a background stall but resets its timer on visibility changes or resume', async () => {
   const f = fixture('https://learning-a.example', '41', [[1]]);
   await f.load().menu.get(start)();
   const page = f.load(f.entries[0].href);
@@ -303,8 +336,11 @@ test('does not reload when paused or while the video is hidden', async () => {
   page.emit('playing');
   page.advanceClock(10000);
   page.document.hidden = true;
+  page.emit('visibilitychange');
   page.advanceClock(120000);
-  page.document.hidden = false;
+  page.emit('resume');
+  page.advanceClock(120000);
+  assert.equal(page.reloads, 0);
   page.video.paused = true;
   page.advanceClock(120000);
   assert.equal(page.reloads, 0);
@@ -312,6 +348,8 @@ test('does not reload when paused or while the video is hidden', async () => {
   page.emit('playing');
   page.advanceClock(10000);
   assert.equal(page.reloads, 0);
+  page.advanceClock(75000);
+  assert.equal(page.reloads, 1);
 });
 
 test('supports another origin, a different stage and course count, mute and rebuild', async () => {
@@ -356,8 +394,8 @@ test('starts at an open required video without claiming earlier videos', async (
 
 test('rejects similar URLs, unapproved sites, wrong stages and malformed queue state', async () => {
   const f = fixture('https://learning-b.example', '72', [[1]]);
-  assert.equal(f.load(f.center, '<h1>课程中心</h1>').menu.size, 0);
-  assert.equal(f.load(f.entries[0].href, '<video></video>').menu.size, 0);
+  assert.deepEqual([...f.load(f.center, '<h1>课程中心</h1>').menu.keys()], ['配置本站页面地址']);
+  assert.deepEqual([...f.load(f.entries[0].href, '<video></video>').menu.keys()], ['配置本站页面地址']);
 
   f.session.set(f.queueKey, JSON.stringify({ entries: f.entries, index: 0, running: true }));
   assert.equal(f.load(f.entries[0].href).timers.size, 0);
@@ -372,6 +410,39 @@ test('rejects similar URLs, unapproved sites, wrong stages and malformed queue s
   const crossSite = { ...f.entries[0], href: f.entries[0].href.replace('learning-b', 'different') };
   f.session.set(f.queueKey, JSON.stringify({ entries: [crossSite], index: 0, running: true }));
   assert.equal(f.load(f.entries[0].href).timers.size, 0);
+});
+
+test('accepts user configured same-origin addresses and isolates separate queues', async () => {
+  const origin = 'https://learning-a.example';
+  const routes = ['/training/home', '/training/materials', '/watch'];
+  const prefs = new Map();
+  const session = new Map();
+  const f = fixture(origin, '41', [[2]], {
+    routes, prefs, session, promptAnswer: origin + routes[0] + '?stg=41\n' + routes.slice(1).join('\n'),
+  });
+  const settings = f.load();
+  settings.menu.get('配置本站页面地址')();
+  assert.equal(settings.reloads, 1);
+  assert.deepEqual(Array.from(prefs.get('routes:' + origin)), routes);
+
+  const customCenter = f.load();
+  await customCenter.menu.get(start)();
+  assert.deepEqual(customCenter.visits, [f.entries[0].href]);
+  assert.ok(session.has(f.queueKey));
+  assert.equal(session.has('jjfz-course-player:queue:41'), false);
+  const video = f.load(f.entries[0].href);
+  video.document.hidden = true;
+  video.complete(true);
+  assert.deepEqual(video.visits, [f.entries[1].href]);
+
+  const alerts = [];
+  const invalid = fixture(origin, '41', [[1]], {
+    routes, prefs, alerts, promptAnswer: routes[0] + '\nhttps://other.example/materials\n' + routes[2],
+  }).load();
+  invalid.menu.get('配置本站页面地址')();
+  assert.equal(alerts.length, 1);
+  assert.equal(invalid.reloads, 0);
+  assert.deepEqual(Array.from(prefs.get('routes:' + origin)), routes);
 });
 
 test('preserves the previous queue when the rebuilt catalog fails validation', async () => {
