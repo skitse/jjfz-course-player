@@ -258,12 +258,16 @@ test('supports another origin, a different stage and course count, mute and rebu
   assert.equal(f.entries.length, 4);
   const first = f.load(f.entries[0].href);
   assert.equal(first.video.muted, true);
+  first.video.muted = false;
+  first.emit('volumechange');
+  assert.equal(first.video.muted, true);
   assert.equal(first.showContinue(), 1);
   assert.equal(first.showContinue(true), 1);
   first.complete(true);
   const second = f.load(f.entries[1].href);
   assert.equal(second.video.muted, true);
   second.menu.get(unmute)();
+  second.emit('volumechange');
   assert.equal(second.video.muted, false);
   second.menu.get(pause)();
   await second.flushTimers();

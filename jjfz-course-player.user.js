@@ -431,6 +431,10 @@
     }
   }
 
+  function keepMute(event) {
+    if (muted && event.target === mutedVideo && !mutedVideo.muted) mutedVideo.muted = true;
+  }
+
   function findVideo() {
     const videos = document.querySelectorAll('video');
     return videos.length === 1 ? videos[0] : document.querySelector('.xgplayer video');
@@ -484,6 +488,7 @@
   document.addEventListener('pause', handlePause, true);
   document.addEventListener('pointerdown', markPlaybackInput, true);
   document.addEventListener('keydown', markPlaybackInput, true);
+  document.addEventListener('volumechange', keepMute, true);
   document.addEventListener('visibilitychange', update);
   update();
 })();
