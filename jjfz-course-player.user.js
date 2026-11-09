@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         JJFZ 培训视频续播
 // @namespace    https://github.com/skitse/jjfz-course-player
-// @version      0.3.0
-// @description  从兼容站点的课程中心生成必修视频队列，按课程、课件和分集顺序续播
+// @version      0.3.1
+// @description  积极分子（JJFZ）培训视频队列，支持断点续播与静音
 // @match        *://*/jjfz/lesson*
 // @match        *://*/jjfz/play*
 // @license      MIT
