@@ -4,7 +4,7 @@
 
 ## 安装和使用
 
-1. 下载 [篡改猴导入包](https://github.com/skitse/jjfz-course-player/releases/latest/download/jjfz-course-player.zip)。在 [篡改猴（Tampermonkey）](https://www.tampermonkey.net/) 的管理面板打开 **实用工具 → 导入**，选择 ZIP 文件。也可以 [下载脚本源码](https://github.com/skitse/jjfz-course-player/releases/latest/download/jjfz-course-player.user.js) 粘贴到编辑器。
+1. 在篡改猴（Tampermonkey）管理面板中选择 **添加新脚本**，粘贴完整源码并保存。 [脚本源码](https://raw.githubusercontent.com/skitse/jjfz-course-player/main/jjfz-course-player.user.js)
 2. 登录培训平台并打开课程中心。在脚本菜单中选择 **开始或继续全部必修视频**。
 3. 需要静音时，选择 **静音播放（记住此站点）**。要取消静音，选择 **恢复声音（记住此站点）**。
 4. **关闭此标签页的自动续播** 会暂停队列。同一标签页可以继续。课程目录更新后，可在课程中心选择 **重新读取必修目录并开始**。
