@@ -64,12 +64,18 @@ function fixture(origin, stage, counts, options = {}) {
     const visits = [];
     const requests = [];
     const timers = new Map();
+    const listeners = new Map();
     const player = new URL(href).pathname === '/jjfz/play';
     const html = markup ?? (player ? '<div class="vlist"><div class="vitem active"></div></div><video></video>' : centerHtml());
     const { document, Event } = parseHTML('<html><head></head><body>' + html + '</body></html>');
     const video = document.querySelector('video');
-    if (video) Object.assign(video, { paused: true, ended: false, muted: false, readyState: 1,
+    if (video) Object.assign(video, { paused: true, ended: false, muted: false, readyState: 1, currentTime: 0,
       calls: 0, async play() { this.calls++; } });
+    const addListener = document.addEventListener.bind(document);
+    document.addEventListener = (type, fn, config) => {
+      listeners.set(type, fn);
+      addListener(type, fn, config);
+    };
     let update;
     let timerId = 0;
     runInNewContext(source, {
@@ -115,6 +121,9 @@ function fixture(origin, stage, counts, options = {}) {
     });
     return {
       menu, visits, requests, timers, video, document,
+      emit(type, options) {
+        listeners.get(type)?.({ type, target: video, ...options });
+      },
       async flushTimers() {
         for (const [id, fn] of timers) {
           timers.delete(id);
@@ -172,6 +181,75 @@ test('walks all 140 episodes across courses, catalog pages and receipts in eithe
   assert.match(f.load().document.querySelector('[role=status]').textContent, /队列已结束 · 140/);
 });
 
+test('recovers an unexpected pause, defers background recovery and leaves deliberate pauses alone', async () => {
+  const f = fixture('https://learning-a.example', '41', [[1]]);
+  await f.load().menu.get(start)();
+  const page = f.load(f.entries[0].href);
+  const { video, document } = page;
+  await page.flushTimers();
+  assert.equal(video.calls, 1);
+
+  video.paused = false;
+  page.emit('playing');
+  video.currentTime = 40;
+  video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(video.calls, 2);
+
+  video.paused = false;
+  page.emit('playing');
+  video.currentTime = 41;
+  video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(video.calls, 2, 'a rapid repeat pause must not trigger a retry loop');
+
+  video.paused = false;
+  page.emit('playing');
+  document.hidden = true;
+  video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(video.calls, 2);
+  document.hidden = false;
+  page.emit('visibilitychange');
+  await page.flushTimers();
+  assert.equal(video.calls, 3);
+
+  video.paused = false;
+  page.emit('playing');
+  video.currentTime = 49;
+  page.emit('pointerdown', { isTrusted: true });
+  video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(video.calls, 3, 'the player pause control must still work');
+});
+
+test('defers recovery while an unfamiliar site dialog is visible', async () => {
+  const f = fixture('https://learning-b.example', '7', [[1]]);
+  await f.load().menu.get(start)();
+  const page = f.load(f.entries[0].href);
+  await page.flushTimers();
+  page.video.paused = false;
+  page.emit('playing');
+
+  const dialog = page.document.createElement('div');
+  dialog.className = 'layui-layer-dialog';
+  dialog.getClientRects = () => [1];
+  page.document.body.append(dialog);
+  page.video.paused = true;
+  page.emit('pause');
+  await page.flushTimers();
+  assert.equal(page.video.calls, 1);
+
+  dialog.remove();
+  page.emit('visibilitychange');
+  await page.flushTimers();
+  assert.equal(page.video.calls, 2);
+});
+
 test('supports another origin, a different stage and course count, mute and rebuild', async () => {
   const f = fixture('https://learning-b.example', '72', [[1], [2, 1]]);
   const index = f.load();
@@ -197,6 +275,15 @@ test('supports another origin, a different stage and course count, mute and rebu
   await newIndex.menu.get(rebuild)();
   assert.deepEqual(newIndex.visits, [f.entries[0].href]);
   assert.equal(f.load(f.entries[0].href).video.muted, false);
+});
+
+test('starts at an open required video without claiming earlier videos', async () => {
+  const f = fixture('https://learning-a.example', '23', [[1], [2, 1]]);
+  const player = f.load(f.entries[2].href);
+  await player.menu.get('从当前视频开始必修队列')();
+  assert.deepEqual(JSON.parse(f.session.get(f.queueKey)).entries, f.entries.slice(2));
+  assert.deepEqual(player.visits, []);
+  assert.match(player.document.querySelector('[role=status]').textContent, /1\/2/);
 });
 
 test('rejects similar URLs, unapproved sites, wrong stages and malformed queue state', async () => {

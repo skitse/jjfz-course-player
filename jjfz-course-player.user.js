@@ -39,6 +39,9 @@
   const approvedKey = 'approved:' + page.origin;
   const muteKey = 'muted:' + page.origin;
   const resumeLoadGraceMs = 3500; // 网站最多等 3 秒读取断点
+  const pauseRecoveryDelayMs = 1200;
+  const manualPauseWindowMs = 800;
+  const minimumProgressBetweenRecoveries = 3;
   const handledButtons = new WeakSet();
   let queue = loadQueue();
   let building = false;
@@ -51,6 +54,10 @@
   let advanced = false;
   let muted = GM_getValue(muteKey, false);
   let mutedVideo;
+  let playedVideo;
+  let recoveryVideo;
+  let lastRecovery;
+  let lastPlaybackInput = -Infinity;
 
   function showStatus(message) {
     if (!status) {
@@ -86,8 +93,12 @@
     const actual = playbackUrl(page.href);
     if (!expected || !actual) return false;
     const episode = expected.searchParams.get('r_id');
-    return expected.searchParams.get('v_id') === actual.searchParams.get('v_id')
-      && (!episode || episode === actual.searchParams.get('r_id'));
+    if (expected.searchParams.get('v_id') !== actual.searchParams.get('v_id')) return false;
+    if (!episode) return true;
+    const selected = document.querySelector('.vlist .vitem.active')?.closest('a');
+    const currentEpisode = actual.searchParams.get('r_id')
+      ?? playbackUrl(selected?.href)?.searchParams.get('r_id');
+    return episode === currentEpisode;
   }
 
   function saveQueue() {
@@ -228,7 +239,7 @@
     update();
   }
 
-  async function startQueue(rebuild = false) {
+  async function startQueue({ rebuild = false, fromCurrent = false } = {}) {
     if (building) return;
     if (!rebuild && queue?.entries[queue.index]) {
       resumeQueue();
@@ -243,7 +254,9 @@
         entries.push(...(await Promise.all(courses.slice(index, index + 3).map(readCatalog))).flat());
       }
       if (!entries.length) throw new Error('没有读到必修视频。');
-      queue = { entries, index: 0, running: true };
+      const firstIndex = fromCurrent ? entries.findIndex(isCurrentVideo) : 0;
+      if (firstIndex < 0) throw new Error('当前视频没有出现在必修目录里。');
+      queue = { entries: entries.slice(firstIndex), index: 0, running: true };
       resumeQueue();
     } catch (error) {
       showStatus(`队列未启动：${error.message} 可在油猴菜单重试。`);
@@ -253,10 +266,8 @@
   }
 
   function findContinueButton() {
-    for (const overlay of document.body.children) {
+    for (const overlay of visiblePlayerOverlays()) {
       // 两种提示由同一个播放器弹窗函数生成。
-      if (overlay.style.zIndex !== '2147483000' || !overlay.getClientRects().length) continue;
-
       const [title, message, controls] = overlay.firstElementChild?.children ?? [];
       const text = message?.textContent.trim();
       const timedPause = title?.textContent.trim() === '提示'
@@ -270,6 +281,17 @@
         button => button.textContent.trim() === label && !button.disabled
       );
     }
+  }
+
+  function visiblePlayerOverlays() {
+    return [...document.body.children].filter(node => node.style?.zIndex === '2147483000'
+      && node.getClientRects().length);
+  }
+
+  function hasBlockingDialog() {
+    return visiblePlayerOverlays().length > 0
+      || [...document.querySelectorAll('.layui-layer, .layui-layer-dialog, [role="dialog"], dialog[open]')]
+        .some(dialog => dialog.getClientRects().length);
   }
 
   function advanceAfterCompletion(video) {
@@ -301,6 +323,74 @@
     }
   }
 
+  async function playVideo(video) {
+    try {
+      await video.play();
+    } catch (error) {
+      if (error.name !== 'NotAllowedError' || !enabled || document.hidden
+        || !video.isConnected || hasBlockingDialog()) return;
+
+      const wasMuted = video.muted;
+      video.muted = true;
+      try {
+        await video.play();
+      } catch {
+        video.muted = wasMuted;
+        showStatus('浏览器拦截了自动播放。');
+      }
+    }
+  }
+
+  function schedulePlayback(video, recovering) {
+    if (startTimer !== null || !video || video.readyState < 1) return;
+    startTimer = setTimeout(() => {
+      startTimer = null;
+      if (!enabled || document.hidden || !(startRequested || recoveryVideo === video)) return;
+      if (!video.isConnected || findContinueButton()) {
+        update();
+        return;
+      }
+      if (hasBlockingDialog()) return;
+
+      startRequested = false;
+      if (recoveryVideo === video) {
+        recoveryVideo = null;
+        lastRecovery = { video, time: video.currentTime };
+      }
+      if (video.paused && !video.ended && !video.error) void playVideo(video);
+    }, recovering ? pauseRecoveryDelayMs : resumeLoadGraceMs);
+  }
+
+  function handlePlaying(event) {
+    if (!enabled || event.target !== findVideo()) return;
+    playedVideo = event.target;
+    startRequested = false;
+    recoveryVideo = null;
+  }
+
+  function handlePause(event) {
+    const video = event.target;
+    if (!enabled || video !== playedVideo || video !== findVideo() || video.ended || video.error) return;
+    if (Date.now() - lastPlaybackInput < manualPauseWindowMs) return;
+    if (!document.hidden && lastRecovery?.video === video
+      && video.currentTime - lastRecovery.time < minimumProgressBetweenRecoveries) return;
+
+    recoveryVideo = video;
+    update();
+  }
+
+  function markPlaybackInput(event) {
+    if (!event.isTrusted || !enabled) return;
+    const target = event.target;
+    const playerClick = event.type === 'pointerdown' && target?.closest?.('video, .xgplayer-play, .xgplayer-start');
+    const playbackKey = event.type === 'keydown' && [' ', 'k', 'MediaPlayPause'].includes(event.key)
+      && !target?.closest?.('input, textarea, button, [contenteditable="true"]');
+    if (!playerClick && !playbackKey) return;
+
+    lastPlaybackInput = Date.now();
+    recoveryVideo = null;
+  }
+
   function update() {
     if (!enabled || document.hidden) return;
 
@@ -309,10 +399,12 @@
       video.muted = true;
       mutedVideo = video;
     }
+    if (video && !video.paused && !video.ended) playedVideo = video;
 
     const button = findContinueButton();
     if (button) {
       startRequested = false;
+      recoveryVideo = null;
       if (!handledButtons.has(button)) {
         handledButtons.add(button);
         button.click();
@@ -324,34 +416,9 @@
     if (queue?.running && video?.ended && !advanced) {
       showStatus(describeQueue() + ' · 等待网站完成回执');
     }
-    if (!startRequested || startTimer !== null || !video || video.readyState < 1) return;
-
-    startTimer = setTimeout(async () => {
-      startTimer = null;
-      if (!enabled || !startRequested || document.hidden) return;
-      if (!video.isConnected || findContinueButton()) {
-        update();
-        return;
-      }
-      startRequested = false;
-      if (!video.paused || video.ended) return;
-
-      try {
-        await video.play();
-      } catch (error) {
-        if (error.name !== 'NotAllowedError' || !enabled || document.hidden
-          || !video.isConnected || findContinueButton()) return;
-
-        const wasMuted = video.muted;
-        video.muted = true;
-        try {
-          await video.play();
-        } catch {
-          video.muted = wasMuted;
-          console.info('[培训视频续播] Chrome 拦截了自动播放，请手动点一次播放。');
-        }
-      }
-    }, resumeLoadGraceMs);
+    if (startRequested || (video && recoveryVideo === video)) {
+      schedulePlayback(video, recoveryVideo === video);
+    }
   }
 
   function setMute(value) {
@@ -375,12 +442,13 @@
   if (path === centerPath) {
     GM_registerMenuCommand('开始或继续全部必修视频', () => startQueue());
     if (queue?.entries[queue.index]) {
-      GM_registerMenuCommand('重新读取必修目录并开始', () => startQueue(true));
+      GM_registerMenuCommand('重新读取必修目录并开始', () => startQueue({ rebuild: true }));
     }
     if (queue) showStatus(describeQueue());
     return;
   }
 
+  GM_registerMenuCommand('从当前视频开始必修队列', () => startQueue({ rebuild: true, fromCurrent: true }));
   GM_registerMenuCommand('开启此标签页的自动续播', () => {
     if (queue?.entries[queue.index]) {
       resumeQueue();
@@ -398,6 +466,7 @@
     sessionStorage.removeItem(enabledKey);
     enabled = false;
     startRequested = false;
+    recoveryVideo = null;
     clearTimeout(startTimer);
     startTimer = null;
     if (queue?.running) {
@@ -411,6 +480,10 @@
   new MutationObserver(update).observe(document.body, { childList: true, subtree: true });
   document.addEventListener('loadedmetadata', update, true);
   document.addEventListener('ended', update, true);
+  document.addEventListener('playing', handlePlaying, true);
+  document.addEventListener('pause', handlePause, true);
+  document.addEventListener('pointerdown', markPlaybackInput, true);
+  document.addEventListener('keydown', markPlaybackInput, true);
   document.addEventListener('visibilitychange', update);
   update();
 })();
