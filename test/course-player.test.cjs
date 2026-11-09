@@ -65,6 +65,9 @@ function fixture(origin, stage, counts, options = {}) {
     const requests = [];
     const timers = new Map();
     const listeners = new Map();
+    const intervals = new Map();
+    let reloads = 0;
+    let now = 0;
     const player = new URL(href).pathname === '/jjfz/play';
     const html = markup ?? (player ? '<div class="vlist"><div class="vitem active"></div></div><video></video>' : centerHtml());
     const { document, Event } = parseHTML('<html><head></head><body>' + html + '</body></html>');
@@ -79,8 +82,8 @@ function fixture(origin, stage, counts, options = {}) {
     let update;
     let timerId = 0;
     runInNewContext(source, {
-      URL, document, DOMParser, AbortSignal, console,
-      location: { href, assign: destination => visits.push(destination) },
+      URL, document, DOMParser, AbortSignal, console, performance: { now: () => now },
+      location: { href, assign: destination => visits.push(destination), reload: () => reloads++ },
       sessionStorage: {
         getItem: key => session.get(key),
         setItem: (key, value) => session.set(key, value),
@@ -92,6 +95,7 @@ function fixture(origin, stage, counts, options = {}) {
       MutationObserver: class { constructor(fn) { update = fn; } observe() {} },
       setTimeout: fn => { timers.set(++timerId, fn); return timerId; },
       clearTimeout: id => timers.delete(id),
+      setInterval: fn => { intervals.set(++timerId, fn); return timerId; },
       async fetch(url, config) {
         assert.equal(url.origin, origin);
         assert.equal(url.searchParams.get('stg'), stage);
@@ -121,6 +125,11 @@ function fixture(origin, stage, counts, options = {}) {
     });
     return {
       menu, visits, requests, timers, video, document,
+      get reloads() { return reloads; },
+      advanceClock(ms) {
+        now += ms;
+        for (const fn of intervals.values()) fn();
+      },
       emit(type, options) {
         listeners.get(type)?.({ type, target: video, ...options });
       },
@@ -248,6 +257,61 @@ test('defers recovery while an unfamiliar site dialog is visible', async () => {
   page.emit('visibilitychange');
   await page.flushTimers();
   assert.equal(page.video.calls, 2);
+});
+
+test('reloads a stuck video at most twice and preserves the queue across reload', async () => {
+  const f = fixture('https://learning-a.example', '41', [[1]]);
+  await f.load().menu.get(start)();
+  const href = f.entries[0].href;
+  const before = f.session.get(f.queueKey);
+
+  function stuck(time = 50) {
+    const page = f.load(href);
+    page.video.paused = false;
+    page.video.currentTime = time;
+    page.emit('playing');
+    page.advanceClock(10000);
+    return page;
+  }
+
+  const first = stuck();
+  first.advanceClock(74000);
+  assert.equal(first.reloads, 0);
+  first.advanceClock(1000);
+  assert.equal(first.reloads, 1);
+  assert.equal(f.session.get(f.queueKey), before);
+
+  const second = stuck();
+  second.advanceClock(75000);
+  assert.equal(second.reloads, 1);
+
+  const third = stuck();
+  third.advanceClock(75000);
+  assert.equal(third.reloads, 0);
+  assert.match(third.document.querySelector('[role=status]').textContent, /停止自动重载/);
+  third.video.currentTime = 56;
+  third.advanceClock(10000);
+  third.advanceClock(75000);
+  assert.equal(third.reloads, 1, 'real progress past the old stall should restore the retry budget');
+});
+
+test('does not reload when paused or while the video is hidden', async () => {
+  const f = fixture('https://learning-a.example', '41', [[1]]);
+  await f.load().menu.get(start)();
+  const page = f.load(f.entries[0].href);
+  page.video.paused = false;
+  page.emit('playing');
+  page.advanceClock(10000);
+  page.document.hidden = true;
+  page.advanceClock(120000);
+  page.document.hidden = false;
+  page.video.paused = true;
+  page.advanceClock(120000);
+  assert.equal(page.reloads, 0);
+  page.video.paused = false;
+  page.emit('playing');
+  page.advanceClock(10000);
+  assert.equal(page.reloads, 0);
 });
 
 test('supports another origin, a different stage and course count, mute and rebuild', async () => {

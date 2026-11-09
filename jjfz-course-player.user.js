@@ -42,6 +42,10 @@
   const pauseRecoveryDelayMs = 1200;
   const manualPauseWindowMs = 800;
   const minimumProgressBetweenRecoveries = 3;
+  const stallCheckMs = 10000;
+  const stallTimeoutMs = 75000;
+  const stallRetryLimit = 2;
+  const stallKey = 'jjfz-course-player:stall:' + [stage, page.searchParams.get('v_id'), page.searchParams.get('r_id')].join(':');
   const handledButtons = new WeakSet();
   let queue = loadQueue();
   let building = false;
@@ -58,6 +62,9 @@
   let recoveryVideo;
   let lastRecovery;
   let lastPlaybackInput = -Infinity;
+  let playbackProgress;
+  let stalledRetries;
+  let reloading = false;
 
   function showStatus(message) {
     if (!status) {
@@ -301,6 +308,7 @@
       .some(dialog => dialog.getClientRects().length && dialog.textContent.trim() === '当前视频播放完毕！');
     if (!confirmed) return;
     advanced = true;
+    sessionStorage.removeItem(stallKey);
 
     if (queue?.running && isCurrentVideo(queue.entries[queue.index])) {
       queue.index++;
@@ -382,6 +390,9 @@
   function markPlaybackInput(event) {
     if (!event.isTrusted || !enabled) return;
     const target = event.target;
+    if (event.type === 'pointerdown' && target?.closest?.('video, .xgplayer-progress')) {
+      playbackProgress = null;
+    }
     const playerClick = event.type === 'pointerdown' && target?.closest?.('video, .xgplayer-play, .xgplayer-start');
     const playbackKey = event.type === 'keydown' && [' ', 'k', 'MediaPlayPause'].includes(event.key)
       && !target?.closest?.('input, textarea, button, [contenteditable="true"]');
@@ -389,6 +400,39 @@
 
     lastPlaybackInput = Date.now();
     recoveryVideo = null;
+  }
+
+  function watchPlaybackProgress() {
+    const video = findVideo();
+    if (!enabled || document.hidden || reloading || video !== playedVideo || !video
+      || video.paused || video.ended || hasBlockingDialog()) {
+      playbackProgress = null;
+      return;
+    }
+
+    const now = performance.now();
+    if (!playbackProgress || playbackProgress.video !== video
+      || video.currentTime > playbackProgress.time + 1) {
+      playbackProgress = { video, time: video.currentTime, at: now };
+    }
+
+    if (stalledRetries && video.currentTime > stalledRetries.anchor + 5) {
+      stalledRetries = null;
+      sessionStorage.removeItem(stallKey);
+    }
+    if (now - playbackProgress.at < stallTimeoutMs) return;
+
+    const attempts = stalledRetries?.attempts ?? 0;
+    if (attempts >= stallRetryLimit) {
+      showStatus('视频长时间没有进展，已停止自动重载。');
+      return;
+    }
+
+    stalledRetries = { attempts: attempts + 1, anchor: Math.max(stalledRetries?.anchor ?? 0, playbackProgress.time) };
+    sessionStorage.setItem(stallKey, JSON.stringify(stalledRetries));
+    reloading = true;
+    showStatus('视频长时间没有进展，正在重新载入并从网站断点续播。');
+    location.reload();
   }
 
   function update() {
@@ -481,6 +525,11 @@
   });
 
   if (queue?.entries[queue.index] && isCurrentVideo(queue.entries[queue.index])) showStatus(describeQueue());
+  try {
+    stalledRetries = JSON.parse(sessionStorage.getItem(stallKey));
+  } catch {
+    sessionStorage.removeItem(stallKey);
+  }
   new MutationObserver(update).observe(document.body, { childList: true, subtree: true });
   document.addEventListener('loadedmetadata', update, true);
   document.addEventListener('ended', update, true);
@@ -490,5 +539,6 @@
   document.addEventListener('keydown', markPlaybackInput, true);
   document.addEventListener('volumechange', keepMute, true);
   document.addEventListener('visibilitychange', update);
+  setInterval(watchPlaybackProgress, stallCheckMs);
   update();
 })();
