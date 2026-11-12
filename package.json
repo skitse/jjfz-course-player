@@ -1,9 +1,11 @@
 {
   "name": "jjfz-course-player",
-  "version": "0.3.3",
+  "version": "0.4.0",
   "private": true,
   "license": "MIT",
   "scripts": {
+    "build": "node scripts/build.cjs",
+    "check": "node scripts/build.cjs --check",
     "test": "node --test"
   },
   "devDependencies": {
